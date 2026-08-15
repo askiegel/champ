@@ -1,6 +1,7 @@
 footprint_to_odom_ekf:
   ros__parameters:
     frequency: 50.0
+    predict_to_current_time: true
     publish_tf: true
     transform_timeout: 0.01
     # transform_time_offset: 0.05
