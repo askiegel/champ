@@ -27,6 +27,21 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 */
 
 #include <quadruped_controller.h>
+#include <fstream>
+#include <limits>
+
+namespace {
+int64_t monotonicNs() {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+std::string readIdentity(const char *path) {
+  std::ifstream input(path); std::string value; input >> value;
+  if(value.empty() || value.size()>64) throw std::runtime_error("missing command identity");
+  return value;
+}
+}
+
 
 champ::PhaseGenerator::Time rosTimeToChampTime(const rclcpp::Time& time)
 {
@@ -66,6 +81,16 @@ QuadrupedController::QuadrupedController():
     this->get_parameter("loop_rate",                   loop_rate);
     this->get_parameter("urdf",                        urdf);
     
+    command_watchdog_ = std::make_unique<champ_guard::Watchdog>(
+        readIdentity("/proc/sys/kernel/random/uuid"),
+        readIdentity("/proc/sys/kernel/random/boot_id"));
+    req_vel_.linear.x = req_vel_.linear.y = req_vel_.angular.z = 0.0;
+    // Default mutually-exclusive callback group serializes receive and gait ticks.
+    guarded_status_ = this->create_publisher<champ_msgs::msg::GuardedCommandStatus>(
+        "guarded_command/status", rclcpp::QoS(1).reliable());
+    guarded_subscription_ = this->create_subscription<champ_msgs::msg::GuardedCommand>(
+        "guarded_command", rclcpp::QoS(1).reliable(),
+        std::bind(&QuadrupedController::guardedCommand_, this, std::placeholders::_1));
     cmd_vel_subscription_ = this->create_subscription<geometry_msgs::msg::Twist>(
         "cmd_vel/smooth", 10, std::bind(&QuadrupedController::cmdVelCallback_, this,  std::placeholders::_1));
     cmd_pose_subscription_ = this->create_subscription<geometry_msgs::msg::Pose>(
@@ -100,6 +125,11 @@ QuadrupedController::QuadrupedController():
 
 void QuadrupedController::controlLoop_()
 {
+    command_watchdog_->tick(monotonicNs());
+    const auto &velocity = command_watchdog_->velocity;
+    req_vel_.linear.x = velocity.x;
+    req_vel_.linear.y = velocity.y;
+    req_vel_.angular.z = velocity.yaw;
     float target_joint_positions[12];
     geometry::Transformation target_foot_positions[4];
     bool foot_contacts[4];
@@ -111,35 +141,63 @@ void QuadrupedController::controlLoop_()
 
     publishFootContacts_(foot_contacts);
     publishJoints_(target_joint_positions);
+    gait_zero_applied_=!command_watchdog_->active;
+    publishGuardedStatus_();
 }
 
 void QuadrupedController::cmdVelCallback_(const geometry_msgs::msg::Twist::SharedPtr msg)
 {
-    req_vel_.linear.x = msg->linear.x;
-    req_vel_.linear.y = msg->linear.y;
-    req_vel_.angular.z = msg->angular.z;
+    // Legacy nonzero Twist cannot bypass guarded admission. Exact zero is an
+    // unconditional emergency gait stop, intentionally not command-scoped.
+    if(command_watchdog_->legacy_twist(
+         {msg->linear.x,msg->linear.y,msg->angular.z},
+         msg->linear.z==0 && msg->angular.x==0 && msg->angular.y==0,monotonicNs()))
+      gait_zero_applied_=false;
+    publishGuardedStatus_();
 }
 
-void QuadrupedController::cmdPoseCallback_(const geometry_msgs::msg::Pose::SharedPtr msg)
-{   
-    
-    tf2::Quaternion quat(
-        msg->orientation.x,
-        msg->orientation.y,
-        msg->orientation.z,
-        msg->orientation.w);
-    
-    tf2::Matrix3x3 m(quat);
-    double roll, pitch, yaw;
-    m.getRPY(roll, pitch, yaw);
-    
-    req_pose_.orientation.roll = roll;
-    req_pose_.orientation.pitch = pitch;
-    req_pose_.orientation.yaw = yaw;
+void QuadrupedController::cmdPoseCallback_(const geometry_msgs::msg::Pose::SharedPtr)
+{
+    // Independent posture commands are outside this guarded mission mode.
+    // Hold the existing nominal pose; no torque-off or pose reset on expiry.
+    command_watchdog_->refuse_body_pose();
+    publishGuardedStatus_();
+}
 
-    req_pose_.position.x = msg->position.x;
-    req_pose_.position.y = msg->position.y;
-    req_pose_.position.z = msg->position.z +  gait_config_.nominal_height;
+void QuadrupedController::guardedCommand_(const champ_msgs::msg::GuardedCommand::SharedPtr msg)
+{
+    champ_guard::Packet p;
+    p.operation=msg->operation; p.controller_session=msg->controller_session;
+    p.host_boot_id=msg->host_boot_id; p.bridge_epoch=msg->bridge_epoch;
+    p.generation=msg->generation; p.sequence=msg->sequence;
+    p.issued_ns=msg->issued_ns; p.start_ns=msg->start_ns; p.deadline_ns=msg->deadline_ns;
+    p.velocity={msg->velocity.linear.x,msg->velocity.linear.y,msg->velocity.angular.z};
+    if(msg->velocity.linear.z!=0 || msg->velocity.angular.x!=0 || msg->velocity.angular.y!=0)
+      p.velocity.x=std::numeric_limits<double>::quiet_NaN();
+    const bool was_active=command_watchdog_->active;
+    const bool accepted=command_watchdog_->receive(p,monotonicNs());
+    if(accepted || was_active!=command_watchdog_->active) gait_zero_applied_=false;
+    if(!command_watchdog_->active)
+      req_vel_.linear.x=req_vel_.linear.y=req_vel_.angular.z=0;
+    publishGuardedStatus_();
+}
+
+void QuadrupedController::publishGuardedStatus_()
+{
+    const auto &g=*command_watchdog_;
+    champ_msgs::msg::GuardedCommandStatus s;
+    s.protocol_version=1; s.controller_session=g.controller_session; s.host_boot_id=g.host_boot_id;
+    s.bridge_epoch=g.bridge_epoch; s.evaluated_ns=g.evaluated_ns;
+    s.generation=g.generation; s.sequence=g.sequence; s.synchronized=g.synchronized;
+    s.active=g.active; s.gait_zero=!g.active && gait_zero_applied_; s.deadline_ns=g.deadline_ns; s.reason=g.reason;
+    s.last_operation=g.last_request.operation;
+    s.last_request_generation=g.last_request.generation;
+    s.last_request_sequence=g.last_request.sequence;
+    s.last_request_issued_ns=g.last_request.issued_ns;
+    s.last_request_accepted=g.last_request_accepted;
+    s.velocity.linear.x=g.velocity.x; s.velocity.linear.y=g.velocity.y;
+    s.velocity.angular.z=g.velocity.yaw;
+    guarded_status_->publish(s);
 }
 
 void QuadrupedController::publishJoints_(float target_joints[12])

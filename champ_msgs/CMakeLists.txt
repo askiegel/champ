@@ -7,6 +7,8 @@ find_package(std_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 
 rosidl_generate_interfaces(${PROJECT_NAME}
+  "msg/GuardedCommand.msg"
+  "msg/GuardedCommandStatus.msg"
   "msg/Velocities.msg"
   "msg/PID.msg"
   "msg/Imu.msg"

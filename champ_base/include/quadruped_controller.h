@@ -29,6 +29,9 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #define QUADRUPED_CONTROLLER_H
 
 #include "rclcpp/rclcpp.hpp"
+#include "command_watchdog.h"
+#include <champ_msgs/msg/guarded_command.hpp>
+#include <champ_msgs/msg/guarded_command_status.hpp>
 
 #include <champ_msgs/msg/joints.hpp>
 #include <champ_msgs/msg/pose.hpp>
@@ -64,6 +67,12 @@ class QuadrupedController: public rclcpp::Node
     rclcpp::Clock clock_;
     
     champ::Velocities req_vel_;
+    bool gait_zero_applied_=false;
+    std::unique_ptr<champ_guard::Watchdog> command_watchdog_;
+    rclcpp::Subscription<champ_msgs::msg::GuardedCommand>::SharedPtr guarded_subscription_;
+    rclcpp::Publisher<champ_msgs::msg::GuardedCommandStatus>::SharedPtr guarded_status_;
+    void guardedCommand_(const champ_msgs::msg::GuardedCommand::SharedPtr msg);
+    void publishGuardedStatus_();
     champ::Pose req_pose_;
 
     champ::GaitConfig gait_config_;

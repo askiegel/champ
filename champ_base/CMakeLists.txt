@@ -107,4 +107,16 @@ install(TARGETS
 ament_export_include_directories(include)
 ament_export_dependencies(${dependencies})
 
+if(BUILD_TESTING)
+  enable_testing()
+  add_executable(command_watchdog_cli test/command_watchdog_cli.cpp)
+  add_executable(command_watchdog_gait_test test/command_watchdog_gait_test.cpp)
+  add_test(NAME guarded_forward_gait COMMAND command_watchdog_gait_test .1 0 0)
+  add_test(NAME guarded_reverse_gait COMMAND command_watchdog_gait_test -.1 0 0)
+  add_test(NAME guarded_left_gait COMMAND command_watchdog_gait_test 0 .08 0)
+  add_test(NAME guarded_right_gait COMMAND command_watchdog_gait_test 0 -.08 0)
+  add_test(NAME guarded_ccw_gait COMMAND command_watchdog_gait_test 0 0 .3)
+  add_test(NAME guarded_cw_gait COMMAND command_watchdog_gait_test 0 0 -.3)
+endif()
+
 ament_package()
